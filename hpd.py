@@ -8,9 +8,9 @@
 #   variants and alternative renditions.
 #
 # TODO
-#   * Support packages with all segments in a single file with byte range requests
-#   * Add output directory option
-#   * Add logging verbosity option
+#   * BYTERANGE
+#   * Absolute URIs - Would have to modify playlist
+#   * HTTP headers - If needed
 
 import argparse
 import logging
@@ -18,100 +18,149 @@ import os
 import threading
 import urllib.request
 
-auth_header = ""
-lock = threading.Lock()
-threads = list()
-max_threads = 10
+_authHeader = ""
+_bytesDownloaded = 0
+_bytesTotal = 0
+_counterLock = threading.Lock()
+_fetchedDict = dict()
+_filesDownloaded = 0
+_filesTotal = 0
+_maxConcurrentDownloads = 10
+_outDir = ""
+_threads = list()
+_threadsLock = threading.Lock()
 
+def fetch(url: tuple, outDir: str) -> None:
+    global _bytesTotal
+    global _fetchedDict
+    global _filesTotal
 
-def isValidUrl(url: str) -> bool:
-    if url == "":
-        logging.error("Invalid URL: empty url")
-        return False
-    elif not (url.startswith("http") or url.startswith("https")):
-        logging.error("Invalid URL: require 'http/https' url")
-        return False
-    elif os.path.splitext(url)[1].lower() != ".m3u8":
-        logging.error("Invalid URL: not hls source")
-        return False
+    if not os.path.exists(outDir):
+        os.makedirs(outDir)
+
+    isPlaylist, _ = isPlaylistUrl(url)
+    filename = os.path.basename(url.path)
+    outPath = os.path.join(outDir, filename)
+
+    with _counterLock:
+        if outPath in _fetchedDict:
+            logging.debug(f"Skipping {outPath} (already fetched)")
+            return
+        else:
+            _fetchedDict[outPath] = True
+
+    if os.path.exists(outPath) and not isPlaylist:
+        logging.debug(f"Skipping {outPath} (already exists)")
+        with _counterLock:
+            _bytesTotal += os.path.getsize(outPath)
+            _filesTotal += 1
     else:
-        return True
+        if isPlaylist:
+            logging.info(f"Downloading playlist to {outPath}")
+        else:
+            logging.debug(f"Downloading to {outPath}")
+        data = readDataFromUrl(url)
+        writeFile(outPath, data)
+        if isPlaylist:
+            parsePlaylist(url, outDir, data)
+        
+def fetchThreaded(url: tuple, outDir: str) -> None:
+    global _threads
 
+    thread = None
+    while True:
+        with _threadsLock:
+            if len(_threads) < _maxConcurrentDownloads:
+                thread = threading.Thread(target=fetch, args=(url, outDir))
+                _threads.append(thread)
+                thread.start()
+                return
+            else:
+                thread = _threads.pop(0)
+        thread.join()
 
-def readDataFromUrl(url: str) -> bytes:
+def fetchUriInPlaylist(uri: str, playlistUrl: tuple, playlistOutDir: str) -> None:
+    uri = uri.strip().strip(b'"').decode()
+    url = urllib.parse.urlparse(uri)
+    if len(url.scheme) != 0:
+        logging.warning(f"Only relative URIs supported, skipping {uri}")
+        return
+    playlistDir = os.path.dirname(playlistUrl.path)
+    outDir = os.path.normpath(os.path.join(playlistOutDir, os.path.dirname(url.path)))
+    path = os.path.normpath(os.path.join(playlistDir, url.path))
+    url = urllib.parse.ParseResult(
+        playlistUrl.scheme, playlistUrl.netloc, path, "", url.query, ""
+    )
+    if isPlaylistUrl(url)[0]:
+        fetch(url, outDir)
+    else:
+        fetchThreaded(url, outDir)
+
+def isPlaylistUrl(url: tuple) -> tuple:
+    if len(url.path) == 0:
+        return False, "Empty url"
+    elif not (url.scheme == "http" or url.scheme == "https"):
+        return False, "Missing http/https scheme"
+    elif os.path.splitext(url.path)[1].lower() != ".m3u8":
+        return False, "Extension is not m3u8"
+    else:
+        return True, None
+
+def parsePlaylist(url: tuple, outDir: str, content: str) -> None:
+    for line in content.splitlines():
+        line = line.strip()
+        if len(line) == 0:
+            continue
+
+        # tag
+        if line.startswith(b"#EXT"):
+            tagSplit = line.split(b":", 1)
+            if len(tagSplit) != 2:
+                continue
+            # attribute list
+            for attr in tagSplit[1].split(b","):
+                if not attr.startswith(b"URI"):
+                    continue
+                if b"BYTERANGE" in line:
+                    raise Exception(f"BYTERANGE not supported: {line}")
+                attrSplit = attr.split(b"=", 1)
+                if len(attrSplit) != 2:
+                    break
+                uri = attrSplit[1].strip().strip(b'"').decode()
+                fetchUriInPlaylist(attrSplit[1], url, outDir)
+                break
+            continue
+        
+        # comment
+        if line.startswith(b"#"):
+            continue
+
+        # URI
+        fetchUriInPlaylist(line, url, outDir)
+
+def readDataFromUrl(url: tuple) -> bytes:
     headers = {}
-    if len(auth_header) > 0:
-        headers["authorization"] = auth_header
-    request = urllib.request.Request(url=url, headers=headers)
+    if len(_authHeader) > 0:
+        headers["authorization"] = _authHeader
+    request = urllib.request.Request(url=url.geturl(), headers=headers)
     with urllib.request.urlopen(request) as response:
         data = response.read()
     return data
 
-
 def writeFile(path: str, data: bytes) -> None:
+    global _bytesDownloaded
+    global _bytesTotal
+    global _filesDownloaded
+    global _filesTotal
+
     with open(path, "wb") as file:
         file.write(data)
+    with _counterLock:
+        _bytesDownloaded += len(data)
+        _bytesTotal += len(data)
+        _filesDownloaded += 1
+        _filesTotal += 1
     return None
-
-
-def parsePlaylist(baseDir: str, relativePath: str, baseUrl: str, data: bytes) -> None:
-    for line in data.splitlines():
-        line = line.strip()
-        extension = os.path.splitext(line)[1]
-        if line.startswith(b"#"):
-            extSplit = line.split(b":", 1)
-            if len(extSplit) != 2:
-                continue
-            for attr in extSplit[1].split(b","):
-                if not attr.startswith(b"URI"):
-                    continue
-                attrSplit = attr.split(b"=", 1)
-                if len(attrSplit) != 2:
-                    break
-                # TODO Only handles relative paths right now
-                uri = attrSplit[1].strip().strip(b'"').decode()
-                fullUrl = os.path.join(baseUrl, relativePath, uri)
-                fetch(fullUrl, baseDir, baseUrl)
-        elif extension.lower() == b".m3u8":
-            playlistUrl = baseUrl + "/" + line.decode()
-            fetch(playlistUrl, baseDir, baseUrl)
-        elif len(extension) > 0:
-            segUrl = os.path.join(baseUrl, relativePath, line.decode())
-            threadedFetch(segUrl, baseDir, baseUrl)
-
-
-def threadedFetch(url: str, baseDir: str, baseUrl: str) -> None:
-    thread = None
-    while True:
-        with lock:
-            if len(threads) >= max_threads:
-                thread = threads.pop(0)
-            else:
-                thread = threading.Thread(target=fetch, args=(url, baseDir, baseUrl))
-                threads.append(thread)
-                break
-        thread.join()
-    thread.start()
-
-
-def fetch(url: str, baseDir: str, baseUrl: str) -> None:
-    # print("\nfetch", "\nurl:", url, "\nbaseDir:", baseDir, "\nbaseUrl:", baseUrl)
-    filename = os.path.basename(url)
-    extension = os.path.splitext(filename)[1]
-    relPath = os.path.dirname(url)[len(baseUrl) :].strip("/")
-    outDir = os.path.join(baseDir, relPath)
-    if not os.path.exists(outDir):
-        os.makedirs(outDir)
-    outPath = os.path.join(outDir, filename)
-    if os.path.exists(outPath) and extension.lower() != ".m3u8":
-        logging.debug("Skipping %s, %s already exists", url, outPath)
-        return
-    logging.debug("Downloading %s to %s", url, outDir)
-    data = readDataFromUrl(url)
-    writeFile(outPath, data)
-    if extension.lower() == ".m3u8":
-        parsePlaylist(baseDir, relPath, baseUrl, data)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -126,43 +175,47 @@ if __name__ == "__main__":
         help="set a bearer token authorization header with each HTTP request",
         type=str,
     )
+    parser.add_argument("-o", "--output", help="the output directory path", type=str)
     parser.add_argument(
         "-t", "--threads", help="the maximum number of concurrent downloads", type=int
     )
+    parser.add_argument("-v", "--verbose", help="verbose logging", action="store_true")
     args = parser.parse_args()
-    url = args.url
+    url = urllib.parse.urlparse(args.url)
     if args.auth:
-        auth_header = "Bearer " + args.auth
+        _authHeader = "Bearer " + args.auth
     if args.threads:
-        max_threads = args.threads
+        _maxConcurrentDownloads = args.threads
+    if args.output:
+        _outDir = os.path.abspath(args.output)
 
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(message)s",
-        level=logging.DEBUG,
+        level=logging.DEBUG if args.verbose else logging.INFO,
         datefmt="%H:%M:%S",
     )
 
-    if isValidUrl(url):
-        # url:       http://.../hls-aes/playlist.m3u8
-        # baseUrl:   http://.../hls-aes
-        baseUrl = os.path.dirname(url)
+    isPlaylist, message = isPlaylistUrl(url)
+    if not isPlaylist:
+        raise Exception(f"Invalid playlist URL: {url}")
 
-        # curPath:   /a/b/c
-        curPath = os.path.abspath(os.curdir)
+    # Use the "directory" name of the playlist by default
+    if len(_outDir) == 0:
+        dirname = os.path.basename(os.path.dirname(url.path))
+        _outDir = os.path.normpath(os.path.join(os.getcwd(), dirname))
+        logging.info(f"Using default output directory: {_outDir}")
+    fetch(url, _outDir)
 
-        # outDir:    /a/b/c/hls-aes
-        outDir = os.path.join(curPath, os.path.basename(baseUrl))
-
-        fetch(url, outDir, baseUrl)
-
-        while True:
-            thread = None
-            with lock:
-                if len(threads) == 0:
-                    break
-                else:
-                    thread = threads.pop(0)
-            thread.join()
-        logging.info("Done")
-    else:
-        exit(-1)
+    logging.info(f"Waiting for {len(_threads)} threads to finish")
+    while True:
+        thread = None
+        with _threadsLock:
+            if len(_threads) == 0:
+                break
+            else:
+                thread = _threads.pop(0)
+                logging.debug(f"{len(_threads)}")
+        thread.join()
+    logging.info(f"Done\n  {_bytesDownloaded} bytes downloaded\n  {_bytesTotal} bytes total\n  {_filesDownloaded} files downloaded\n  {_filesTotal} files total")
+    os.system(f"echo {_bytesDownloaded} bytes downloaded | numfmt --to=iec-i")
+    os.system(f"echo {_bytesTotal} bytes total | numfmt --to=iec-i")

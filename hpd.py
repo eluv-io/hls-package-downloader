@@ -8,9 +8,9 @@
 #   variants and alternative renditions.
 #
 # TODO
-#   * BYTERANGE
+#   * BYTERANGE (multiple segments per file)
 #   * Absolute URIs - Would have to modify playlist
-#   * HTTP headers - If needed
+#   * Additional HTTP headers - If needed
 
 import argparse
 import logging
@@ -126,7 +126,6 @@ def parsePlaylist(url: tuple, outDir: str, content: str) -> None:
                 attrSplit = attr.split(b"=", 1)
                 if len(attrSplit) != 2:
                     break
-                uri = attrSplit[1].strip().strip(b'"').decode()
                 fetchUriInPlaylist(attrSplit[1], url, outDir)
                 break
             continue
